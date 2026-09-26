@@ -28,6 +28,10 @@ async function fakeServer(claimStatus = 200) {
 			if (claimStatus !== 200) return json({ error: 'この実行の中身は受け取れません' }, claimStatus);
 			return json({ spec: spec(base, origin()) });
 		}
+		if (req.url === '/runner/mcp') {
+			// aiColle の MCP（2026-07-28 版）。一覧だけ返す
+			return json({ jsonrpc: '2.0', id: body.id, result: { resultType: 'complete', tools: [{ name: 'get_ticket', inputSchema: { type: 'object' } }] } });
+		}
 		if (req.url!.endsWith('/state')) return json({ status: 'running', cancel_requested: false, pending_questions: 0, answers: [] });
 		if (req.url!.startsWith('/repos/') && req.method === 'GET') return json([] as unknown as object);
 		if (req.url!.startsWith('/repos/') && req.method === 'POST') return json({ number: 42 }, 201);
@@ -125,6 +129,12 @@ test('OIDC トークンと合言葉で中身を受け取り、秘密を mask し
 	assert.equal(seen.baseUrl, `${server.base}/anthropic`);
 	assert.equal(seen.apiKey, '12.runsecret');
 	assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
+
+	// aiColle のツールは受け取った実行トークンで、2026-07-28 版で呼ぶ
+	const mcp = server.calls.find((c) => c.path === '/runner/mcp')!;
+	assert.equal(mcp.headers.authorization, 'Bearer 12.runsecret');
+	assert.equal(mcp.headers['mcp-protocol-version'], '2026-07-28');
+	assert.equal(mcp.headers['mcp-method'], 'tools/list');
 
 	// 終わりを知らせ、ジョブのまとめに残す
 	assert.ok(server.calls.some((c) => c.path === '/runner/runs/12/finish' && c.body.status === 'succeeded'));

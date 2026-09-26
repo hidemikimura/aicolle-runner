@@ -1,5 +1,6 @@
 import type { Options, SDKMessage, SessionStore } from '@anthropic-ai/claude-agent-sdk';
 import type { AicolleClient } from './client.js';
+import { aicolleMcpServer } from './mcp-bridge.js';
 import type { RunSpec } from './spec.js';
 
 /** Agent SDK の query（テストで差し替える） */
@@ -42,6 +43,10 @@ export async function runAgent(
 	queryFn: QueryFn,
 	abortController: AbortController,
 ): Promise<AgentResult> {
+	// aiColle のツールは橋渡しを通す（SDK の MCP クライアントは aiColle の版を話せない。mcp-bridge.ts）
+	// 一覧を取れなければここで投げて、ツールの無いまま動かさない
+	const aicolle = await aicolleMcpServer(client.mcp(spec.mcp.url));
+
 	const options: Options = {
 		cwd,
 		abortController,
@@ -57,13 +62,7 @@ export async function runAgent(
 		// サンドボックスの中なので確認なしで道具を使う（外への通信は Sandbox 側で絞る）
 		permissionMode: 'bypassPermissions',
 		allowDangerouslySkipPermissions: true,
-		mcpServers: {
-			aicolle: {
-				type: 'http',
-				url: spec.mcp.url,
-				headers: client.authHeaders(),
-			},
-		},
+		mcpServers: { aicolle },
 		sessionStore: sessionStore(client),
 		...(spec.ai.model ? { model: spec.ai.model } : {}),
 		...(spec.ai.max_budget_usd != null ? { maxBudgetUsd: Math.max(0.01, spec.ai.max_budget_usd) } : {}),
@@ -82,6 +81,15 @@ export async function runAgent(
 	};
 
 	for await (const message of queryFn({ prompt: input.prompt, options })) {
+		// SDK が aiColle のツールに繋げなかったら止める（ツールが無いと人に質問も成果物の登録もできない）
+		if (message.type === 'system' && message.subtype === 'init') {
+			const status = message.mcp_servers?.find((server) => server.name === 'aicolle')?.status;
+			if (status && status !== 'connected') {
+				abortController.abort();
+				throw new Error(`aiColle のツールに繋がりませんでした（${status}）`);
+			}
+		}
+
 		if ('session_id' in message && typeof message.session_id === 'string' && message.session_id) {
 			result.sessionId = message.session_id;
 		}

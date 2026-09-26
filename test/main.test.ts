@@ -7,6 +7,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { execute } from '../src/main.js';
 import { describeTool, type QueryFn } from '../src/agent.js';
 import type { RunSpec } from '../src/spec.js';
@@ -14,6 +16,8 @@ import type { RunSpec } from '../src/spec.js';
 /** サーバー（aiColle と GitHub の両方のふりをする） */
 async function fakeServer(handlers: {
 	state?: () => object;
+	/** /runner/mcp の応答を差し替える（既定は jimble-mcp と同じ確かめ方をするふり） */
+	mcp?: (req: IncomingMessage, body: any) => { status: number; value: object };
 }) {
 	const calls: { method: string; path: string; body: any }[] = [];
 	const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -25,6 +29,10 @@ async function fakeServer(handlers: {
 			res.writeHead(status, { 'Content-Type': 'application/json' });
 			res.end(JSON.stringify(value));
 		};
+		if (req.url === '/runner/mcp') {
+			const { status, value } = (handlers.mcp ?? fakeMcp)(req, body);
+			return json(value, status);
+		}
 		if (req.url!.endsWith('/state')) return json(handlers.state?.() ?? { status: 'running', cancel_requested: false, pending_questions: 0, answers: [] });
 		if (req.url!.startsWith('/repos/') && req.method === 'GET') return json([] as unknown as object);
 		if (req.url!.startsWith('/repos/') && req.method === 'POST') return json({ number: 42 }, 201);
@@ -33,6 +41,30 @@ async function fakeServer(handlers: {
 	await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
 	const port = (server.address() as AddressInfo).port;
 	return { calls, base: `http://127.0.0.1:${port}`, close: () => server.close() };
+}
+
+/** aiColle の MCP のふり（2026-07-28 版。jimble-mcp と同じくヘッダと本文を突き合わせる） */
+function fakeMcp(req: IncomingMessage, body: any): { status: number; value: object } {
+	const error = (message: string) => ({ status: 400, value: { jsonrpc: '2.0', id: body?.id ?? null, error: { code: -32001, message } } });
+	if (req.headers.authorization !== 'Bearer 7.secret') return { status: 401, value: { error: 'unauthorized' } };
+	if (req.headers['mcp-protocol-version'] !== '2026-07-28') return error('MCP-Protocol-Version ヘッダがありません');
+	if (body.params?._meta?.['io.modelcontextprotocol/protocolVersion'] !== '2026-07-28') return error('プロトコルの版がありません');
+	if (req.headers['mcp-method'] !== body.method) return error('Mcp-Method ヘッダが本文と一致しません');
+	const ok = (result: object) => ({ status: 200, value: { jsonrpc: '2.0', id: body.id, result: { resultType: 'complete', ...result } } });
+	switch (body.method) {
+		case 'tools/list':
+			return ok({
+				tools: [
+					{ name: 'get_ticket', description: 'チケットを読む', inputSchema: { type: 'object', properties: {} } },
+					{ name: 'save_artifact', description: '成果物を登録する', inputSchema: { type: 'object', properties: { title: { type: 'string' } } } },
+				],
+			});
+		case 'tools/call':
+			if (req.headers['mcp-name'] !== body.params.name) return error('Mcp-Name ヘッダが本文と一致しません');
+			return ok({ content: [{ type: 'text', text: `${body.params.name} ${JSON.stringify(body.params.arguments)}` }] });
+		default:
+			return { status: 404, value: { jsonrpc: '2.0', id: body.id, error: { code: -32601, message: '知らないメソッドです' } } };
+	}
 }
 
 /** 取り出せる origin（bare リポジトリに main を1つ置いたもの） */
@@ -221,4 +253,69 @@ test('git のエラーの文にトークンを出さない', async () => {
 		return true;
 	});
 	assert.equal(git.redact('token ghs_SECRET123 here'), 'token *** here');
+});
+
+test('aiColle のツールは橋渡しを通して SDK に渡り、呼び出しは 2026-07-28 版で aiColle に届く', async () => {
+	const server = await fakeServer({});
+	const seen: { tools: string[]; call: string } = { tools: [], call: '' };
+
+	const queryFn: QueryFn = async function* ({ options }) {
+		const config = options!.mcpServers!.aicolle as { type: string; instance: any };
+		assert.equal(config.type, 'sdk');
+
+		// SDK の代わりに MCP のクライアントで繋ぐ（SDK が中でしているのと同じ）
+		const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+		await config.instance.connect(serverSide);
+		const mcp = new Client({ name: 'test', version: '1' });
+		await mcp.connect(clientSide);
+		seen.tools = (await mcp.listTools()).tools.map((t) => t.name);
+		const result = await mcp.callTool({ name: 'save_artifact', arguments: { title: '要件' } });
+		seen.call = (result.content as { text: string }[])[0].text;
+		await mcp.close();
+
+		yield { type: 'system', subtype: 'init', session_id: 's', mcp_servers: [{ name: 'aicolle', status: 'connected' }] } as unknown as SDKMessage;
+		yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's', total_cost_usd: 0, usage: {} } as unknown as SDKMessage;
+	};
+
+	const body = await execute(spec(server.base, origin()), { queryFn, pollMs: 50 });
+
+	assert.equal(body.status, 'succeeded', body.error);
+	assert.deepEqual(seen.tools, ['get_ticket', 'save_artifact']);
+	assert.equal(seen.call, 'save_artifact {"title":"要件"}');
+
+	server.close();
+});
+
+test('aiColle のツールの一覧を取れなければ、エージェントを動かさずに failed', async () => {
+	const server = await fakeServer({
+		mcp: (_req, body) => ({ status: 400, value: { jsonrpc: '2.0', id: body.id, error: { code: -32001, message: 'ヘッダがありません' } } }),
+	});
+	let started = false;
+	const queryFn: QueryFn = async function* () {
+		started = true;
+		yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's', total_cost_usd: 0, usage: {} } as unknown as SDKMessage;
+	};
+
+	const body = await execute(spec(server.base, origin()), { queryFn, pollMs: 50 });
+
+	assert.equal(body.status, 'failed');
+	assert.match(body.error!, /aiColle の MCP（tools\/list）: ヘッダがありません/);
+	assert.equal(started, false);
+
+	server.close();
+});
+
+test('SDK が aiColle のツールに繋げなかったら failed', async () => {
+	const server = await fakeServer({});
+	const queryFn: QueryFn = async function* () {
+		yield { type: 'system', subtype: 'init', session_id: 's', mcp_servers: [{ name: 'aicolle', status: 'failed' }] } as unknown as SDKMessage;
+		yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's', total_cost_usd: 0, usage: {} } as unknown as SDKMessage;
+	};
+
+	const body = await execute(spec(server.base, origin()), { queryFn, pollMs: 50 });
+
+	assert.equal(body.status, 'failed');
+	assert.match(body.error!, /aiColle のツールに繋がりませんでした（failed）/);
+
+	server.close();
 });

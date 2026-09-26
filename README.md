@@ -17,6 +17,9 @@ GitHub Actions では、aiColle が workflow_dispatch で起こしたジョブ�
     server: ${{ inputs.server }}
 ```
 
+aiColle のツール（MCP）は `src/mcp-bridge.ts` を通して SDK に渡す。aiColle の MCP は 2026-07-28 版で、SDK の MCP クライアントは直接繋げないため
+（[ai-run.md](../docs/design/ai-run.md)「MCP ツール」）。
+
 ワークフローには `permissions: id-token: write` が要る。Secrets は要らない（ジョブは GitHub の OIDC トークンで aiColle に名乗る）。
 仕組みは aiColle の `docs/design/github-actions-runner.md`。
 

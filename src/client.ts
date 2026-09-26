@@ -1,3 +1,4 @@
+import { AicolleMcp } from './mcp-bridge.js';
 import type { FinishBody, RunEvent, RunSpec } from './spec.js';
 
 /** /runner/runs/{id}/state の応答 */
@@ -105,6 +106,11 @@ export class AicolleClient {
 	/** MCP の接続設定に入れるヘッダ */
 	authHeaders(): Record<string, string> {
 		return { Authorization: `Bearer ${this.token}` };
+	}
+
+	/** aiColle の MCP（2026-07-28 版）を呼ぶ口。SDK には mcp-bridge.ts の橋渡しを通して渡す */
+	mcp(url: string): AicolleMcp {
+		return new AicolleMcp(url, this.authHeaders(), this.fetchFn);
 	}
 
 	private async request(method: string, path: string, body?: unknown): Promise<unknown> {
