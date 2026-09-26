@@ -6,7 +6,8 @@ import { AicolleClient, type RunState } from './client.js';
 import { runAgent, type AgentResult, type QueryFn } from './agent.js';
 import { Git } from './git.js';
 import { ensurePullRequest } from './github.js';
-import type { FinishBody, RunSpec } from './spec.js';
+import { writeDecisions } from './decisions.js';
+import type { Decision, FinishBody, RunSpec } from './spec.js';
 
 /** 差し替えられる部品（テスト用） */
 export interface Deps {
@@ -35,6 +36,7 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 	const elapsed = () => Math.round((Date.now() - startedAt) / 1000);
 	const baselineCost = spec.resume?.previous_cost_usd ?? 0;
 	let last: AgentResult | null = null;
+	const received: Decision[] = [];
 
 	const usage = () => ({
 		input_tokens: last?.inputTokens ?? 0,
@@ -116,6 +118,9 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 
 			if (pending > 0 || answers.size === 0) {
 				// 来なかった。作業中のものを残して止まる（届いた回答は ack しないので、次の起動で渡される）
+				if (spec.github_token) {
+					await writeDecisionsWith(repoDir, spec, received);
+				}
 				if (spec.github_token && (await git.commitAll(`${spec.ticket.key}: 作業中（回答待ち）`))) {
 					await git.push();
 				}
@@ -123,6 +128,10 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 			}
 
 			await client.ackAnswers([...answers.keys()]);
+			// この起動の中で受け取った回答も決定記録に入れる（spec.decisions は起動したときのもの）
+			for (const a of answers.values()) {
+				received.push({ question: a.question, answer: a.answer, options: [], recommended: '', reason: '', answered_at: new Date().toISOString() });
+			}
 			input = {
 				prompt:
 					'人から回答がありました。これを踏まえて作業を続けてください。\n' +
@@ -143,6 +152,10 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 		let prNumber: number | undefined;
 
 		if (spec.github_token) {
+			const written = await writeDecisionsWith(repoDir, spec, received);
+			if (written) {
+				client.event('log', `決まったことを ${written} に書きました`);
+			}
 			await git.commitAll(`${spec.ticket.key}: ${spec.ticket.title}`);
 			if (await git.hasCommitsAhead()) {
 				await git.push();
@@ -169,6 +182,13 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 		}
 		await client.flush();
 	}
+}
+
+/** 起動したときの回答と、この起動の中で受け取った回答を合わせて決定記録を書く（同じ質問は1つ） */
+async function writeDecisionsWith(repoDir: string, spec: RunSpec, received: Decision[]): Promise<string | null> {
+	const known = new Set((spec.decisions ?? []).map((d) => d.question));
+	const decisions = [...(spec.decisions ?? []), ...received.filter((d) => !known.has(d.question))];
+	return writeDecisions(repoDir, { ...spec, decisions });
 }
 
 function finishBody(

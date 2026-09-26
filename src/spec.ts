@@ -34,6 +34,18 @@ export interface RunSpec {
 		test_command: string;
 	};
 	question_wait_seconds: number;
+	/** 回答の出た判断依頼（決定記録として {docs_root}/decisions/{キー}.md に書く。古いサーバーは送らない） */
+	decisions?: Decision[];
+}
+
+/** 回答の出た判断依頼 */
+export interface Decision {
+	question: string;
+	options: string[];
+	recommended: string;
+	reason: string;
+	answer: string;
+	answered_at: string;
 }
 
 /** サーバーへ送る出来事 */

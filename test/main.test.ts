@@ -319,3 +319,46 @@ test('SDK が aiColle のツールに繋げなかったら failed', async () => 
 
 	server.close();
 });
+
+test('回答の出た判断依頼は docs/decisions/{キー}.md に書いて、同じ PR に入れる', async () => {
+	const server = await fakeServer({});
+	const bare = origin();
+
+	const body = await execute(
+		spec(server.base, bare, {
+			decisions: [{
+				question: 'ログインの方式は\nどちらにしますか？',
+				options: ['メール＋パスワード', 'GitHub OAuth'],
+				recommended: 'メール＋パスワード',
+				reason: 'Phase 0 の要件どおり',
+				answer: 'GitHub OAuth',
+				answered_at: '2026-09-26T01:02:03Z',
+			}],
+		}),
+		{ queryFn: fakeQuery([]), pollMs: 50 },
+	);
+
+	assert.equal(body.status, 'succeeded');
+	const file = execFileSync('git', ['--git-dir', bare, 'show', 'aicolle/PM-1:docs/decisions/PM-1.md']).toString();
+	assert.match(file, /^---\nid: decision-PM-1\nkind: decision\nsource_tickets: \[PM-1\]\n---/);
+	assert.match(file, /## ログインの方式は どちらにしますか？/);
+	assert.match(file, /- 決まったこと: \*\*GitHub OAuth\*\*（2026-09-26）/);
+	assert.match(file, /- AI の推奨: メール＋パスワード — Phase 0 の要件どおり/);
+
+	const events = server.calls.filter((c) => c.path.endsWith('/events')).flatMap((c) => c.body.events);
+	assert.ok(events.some((e: any) => e.message === '決まったことを docs/decisions/PM-1.md に書きました'));
+
+	server.close();
+});
+
+test('回答が無ければ決定記録は作らない', async () => {
+	const server = await fakeServer({});
+	const bare = origin();
+
+	await execute(spec(server.base, bare), { queryFn: fakeQuery([]), pollMs: 50 });
+
+	const tree = execFileSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'aicolle/PM-1']).toString();
+	assert.ok(!tree.includes('docs/decisions/'));
+
+	server.close();
+});
