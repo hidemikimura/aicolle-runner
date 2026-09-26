@@ -57,12 +57,18 @@ export async function runAgent(
 			preset: 'claude_code',
 			append:
 				'あなたは aiColle のサンドボックスの中で動いている。人との連絡は MCP の aicolle のツールだけで行う。' +
-				'git のコミット・push・PR 作成はランナーが行うので、あなたはしない。',
+				'git のコミット・push・PR 作成はランナーが行うので、あなたはしない。' +
+				// 再開（resume）のときも毎回付くので、途中から英語に戻らない
+				'人に向けて書くもの（最後のまとめ・判断依頼・進捗・成果物・要件・設計・ドキュメント）は必ず日本語で書く。' +
+				'英語で考えた・英語の出力を読んだときも、返すときは日本語にする。コード・識別子・コマンド・エラーの原文はそのままでよい。' +
+				(spec.target_level === 'audit' ? 'いまは乖離の見回りなので、ファイルを変えず、見つけた食い違いは report_drift で報告する。' : ''),
 		},
 		// サンドボックスの中なので確認なしで道具を使う（外への通信は Sandbox 側で絞る）
 		permissionMode: 'bypassPermissions',
 		allowDangerouslySkipPermissions: true,
 		mcpServers: { aicolle },
+		// 乖離の見回りは読むだけ（書き換える道具を渡さない。Bash での grep やテストは使える）
+		...(spec.target_level === 'audit' ? { disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'] } : {}),
 		sessionStore: sessionStore(client),
 		...(spec.ai.model ? { model: spec.ai.model } : {}),
 		...(spec.ai.max_budget_usd != null ? { maxBudgetUsd: Math.max(0.01, spec.ai.max_budget_usd) } : {}),

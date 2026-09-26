@@ -118,10 +118,10 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 
 			if (pending > 0 || answers.size === 0) {
 				// 来なかった。作業中のものを残して止まる（届いた回答は ack しないので、次の起動で渡される）
-				if (spec.github_token) {
+				if (spec.github_token && spec.target_level !== 'audit') {
 					await writeDecisionsWith(repoDir, spec, received);
 				}
-				if (spec.github_token && (await git.commitAll(`${spec.ticket.key}: 作業中（回答待ち）`))) {
+				if (spec.github_token && spec.target_level !== 'audit' && (await git.commitAll(`${spec.ticket.key}: 作業中（回答待ち）`))) {
 					await git.push();
 				}
 				return finishBody(spec, 'waiting_answer', last, usage, elapsed);
@@ -150,6 +150,12 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 		// コミット・push・PR
 		const summary = last?.resultText?.trim() || '作業が終わりました';
 		let prNumber: number | undefined;
+
+		// 乖離の見回りは読むだけ。変更があっても（テストの生成物など）コミットも push もしない
+		if (spec.target_level === 'audit') {
+			client.event('log', '見回りが終わりました（ファイルは変えていません）');
+			return finishBody(spec, 'succeeded', last, usage, elapsed, { summary });
+		}
 
 		if (spec.github_token) {
 			const written = await writeDecisionsWith(repoDir, spec, received);

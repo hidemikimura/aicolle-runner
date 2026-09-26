@@ -6,7 +6,8 @@
 export interface RunSpec {
 	run_id: number;
 	attempt: number;
-	target_level: 'requirement' | 'design' | 'develop';
+	/** audit = docs とコードの乖離の見回り（ファイルを変えない・コミットも PR もしない。docs/design/drift.md） */
+	target_level: 'requirement' | 'design' | 'develop' | 'audit';
 	instructions: string;
 	/** エージェントへの最初の指示（サーバーが conf/prompts/run.md から組み立てたもの） */
 	prompt: string;
