@@ -71,7 +71,14 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 		const git = new Git(repoDir, spec);
 
 		const how = await git.prepare();
-		client.event('log', how === 'resumed' ? `ブランチ ${spec.repository.branch} の続きから始めます` : `ブランチ ${spec.repository.branch} を作りました`);
+		client.event(
+			'log',
+			how === 'resumed'
+				? `ブランチ ${spec.repository.branch} の続きから始めます`
+				: how === 'recreated'
+					? `最初からやり直すので、ブランチ ${spec.repository.branch} を既定ブランチから作り直しました`
+					: `ブランチ ${spec.repository.branch} を作りました`,
+		);
 
 		let input = spec.resume?.session_id
 			? { prompt: spec.resume.prompt ?? '続けてください', resume: spec.resume.session_id }
@@ -163,7 +170,11 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 				client.event('log', `決まったことを ${written} に書きました`);
 			}
 			await git.commitAll(`${spec.ticket.key}: ${spec.ticket.title}`);
-			if (await git.hasCommitsAhead()) {
+			if (git.needsOverwrite() && !(await git.hasCommitsAhead())) {
+				// 最初からやり直して何も残らなかった: 古いコミットを消すために、既定ブランチの先頭で上書きする
+				await git.push();
+				client.event('log', '変更はありませんでした（ブランチを既定ブランチに戻しました）');
+			} else if (await git.hasCommitsAhead()) {
 				await git.push();
 				prNumber = await ensurePullRequest(
 					spec,

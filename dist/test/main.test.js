@@ -274,4 +274,71 @@ test('SDK が aiColle のツールに繋げなかったら failed', async () => 
     assert.match(body.error, /aiColle のツールに繋がりませんでした（failed）/);
     server.close();
 });
+test('回答の出た判断依頼は docs/decisions/{キー}.md に書いて、同じ PR に入れる', async () => {
+    const server = await fakeServer({});
+    const bare = origin();
+    const body = await execute(spec(server.base, bare, {
+        decisions: [{
+                question: 'ログインの方式は\nどちらにしますか？',
+                options: ['メール＋パスワード', 'GitHub OAuth'],
+                recommended: 'メール＋パスワード',
+                reason: 'Phase 0 の要件どおり',
+                answer: 'GitHub OAuth',
+                answered_at: '2026-09-26T01:02:03Z',
+            }],
+    }), { queryFn: fakeQuery([]), pollMs: 50 });
+    assert.equal(body.status, 'succeeded');
+    const file = execFileSync('git', ['--git-dir', bare, 'show', 'aicolle/PM-1:docs/decisions/PM-1.md']).toString();
+    assert.match(file, /^---\nid: decision-PM-1\nkind: decision\nsource_tickets: \[PM-1\]\n---/);
+    assert.match(file, /## ログインの方式は どちらにしますか？/);
+    assert.match(file, /- 決まったこと: \*\*GitHub OAuth\*\*（2026-09-26）/);
+    assert.match(file, /- AI の推奨: メール＋パスワード — Phase 0 の要件どおり/);
+    const events = server.calls.filter((c) => c.path.endsWith('/events')).flatMap((c) => c.body.events);
+    assert.ok(events.some((e) => e.message === '決まったことを docs/decisions/PM-1.md に書きました'));
+    server.close();
+});
+test('回答が無ければ決定記録は作らない', async () => {
+    const server = await fakeServer({});
+    const bare = origin();
+    await execute(spec(server.base, bare), { queryFn: fakeQuery([]), pollMs: 50 });
+    const tree = execFileSync('git', ['--git-dir', bare, 'ls-tree', '-r', '--name-only', 'aicolle/PM-1']).toString();
+    assert.ok(!tree.includes('docs/decisions/'));
+    server.close();
+});
+test('エージェントには「人に向けて書くものは日本語」を毎回（再開のときも）伝える', async () => {
+    const server = await fakeServer({});
+    const appends = [];
+    const queryFn = async function* ({ options }) {
+        appends.push(options.systemPrompt.append);
+        yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', session_id: 's', total_cost_usd: 0, usage: {} };
+    };
+    await execute(spec(server.base, origin(), { attempt: 2, resume: { session_id: 's', prompt: '回答: A' } }), { queryFn, pollMs: 50 });
+    assert.equal(appends.length, 1);
+    assert.match(appends[0], /必ず日本語で書く/);
+    server.close();
+});
+test('乖離の見回り（audit）はファイルを書き換える道具を渡さず、コミットも push も PR もしない', async () => {
+    const server = await fakeServer({});
+    const bare = origin();
+    const prompts = [];
+    const options = [];
+    const inner = fakeQuery(prompts);
+    const queryFn = (params) => {
+        options.push({
+            disallowed: params.options?.disallowedTools,
+            append: (params.options?.systemPrompt).append,
+        });
+        return inner(params);
+    };
+    const body = await execute(spec(server.base, bare, { target_level: 'audit' }), { queryFn, pollMs: 50 });
+    assert.equal(body.status, 'succeeded');
+    assert.equal(body.pr_number, undefined);
+    assert.equal(body.summary, 'まとめ 1');
+    assert.deepEqual(options[0].disallowed, ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+    assert.match(options[0].append, /report_drift/);
+    // エージェントがファイルを書いても（偽のエージェントは書く）、ブランチは push されない・PR も作らない
+    assert.throws(() => execFileSync('git', ['--git-dir', bare, 'rev-parse', '--verify', 'aicolle/PM-1'], { stdio: 'pipe' }));
+    assert.equal(server.calls.filter((c) => c.path === '/repos/ecx/sample/pulls').length, 0);
+    server.close();
+});
 //# sourceMappingURL=main.test.js.map

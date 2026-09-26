@@ -9,6 +9,8 @@ export interface RunSpec {
 	/** audit = docs とコードの乖離の見回り（ファイルを変えない・コミットも PR もしない。docs/design/drift.md） */
 	target_level: 'requirement' | 'design' | 'develop' | 'audit';
 	instructions: string;
+	/** やり直す工程（空 = 続きから / goal = 最初から: ブランチを既定ブランチから作り直す / requirement / design / implement）。古いサーバーは送らない */
+	restart_from?: '' | 'goal' | 'requirement' | 'design' | 'implement';
 	/** エージェントへの最初の指示（サーバーが conf/prompts/run.md から組み立てたもの） */
 	prompt: string;
 	/** 判断依頼から再開するとき */

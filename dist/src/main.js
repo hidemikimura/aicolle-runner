@@ -6,6 +6,7 @@ import { AicolleClient } from './client.js';
 import { runAgent } from './agent.js';
 import { Git } from './git.js';
 import { ensurePullRequest } from './github.js';
+import { writeDecisions } from './decisions.js';
 /**
  * 1回の起動（docs/design/ai-run.md）
  *
@@ -23,6 +24,7 @@ export async function execute(spec, deps) {
     const elapsed = () => Math.round((Date.now() - startedAt) / 1000);
     const baselineCost = spec.resume?.previous_cost_usd ?? 0;
     let last = null;
+    const received = [];
     const usage = () => ({
         input_tokens: last?.inputTokens ?? 0,
         output_tokens: last?.outputTokens ?? 0,
@@ -90,12 +92,19 @@ export async function execute(spec, deps) {
             }
             if (pending > 0 || answers.size === 0) {
                 // 来なかった。作業中のものを残して止まる（届いた回答は ack しないので、次の起動で渡される）
-                if (spec.github_token && (await git.commitAll(`${spec.ticket.key}: 作業中（回答待ち）`))) {
+                if (spec.github_token && spec.target_level !== 'audit') {
+                    await writeDecisionsWith(repoDir, spec, received);
+                }
+                if (spec.github_token && spec.target_level !== 'audit' && (await git.commitAll(`${spec.ticket.key}: 作業中（回答待ち）`))) {
                     await git.push();
                 }
                 return finishBody(spec, 'waiting_answer', last, usage, elapsed);
             }
             await client.ackAnswers([...answers.keys()]);
+            // この起動の中で受け取った回答も決定記録に入れる（spec.decisions は起動したときのもの）
+            for (const a of answers.values()) {
+                received.push({ question: a.question, answer: a.answer, options: [], recommended: '', reason: '', answered_at: new Date().toISOString() });
+            }
             input = {
                 prompt: '人から回答がありました。これを踏まえて作業を続けてください。\n' +
                     [...answers.values()].map((a) => `\n- 質問: ${a.question}\n  回答: ${a.answer}`).join(''),
@@ -111,7 +120,16 @@ export async function execute(spec, deps) {
         // コミット・push・PR
         const summary = last?.resultText?.trim() || '作業が終わりました';
         let prNumber;
+        // 乖離の見回りは読むだけ。変更があっても（テストの生成物など）コミットも push もしない
+        if (spec.target_level === 'audit') {
+            client.event('log', '見回りが終わりました（ファイルは変えていません）');
+            return finishBody(spec, 'succeeded', last, usage, elapsed, { summary });
+        }
         if (spec.github_token) {
+            const written = await writeDecisionsWith(repoDir, spec, received);
+            if (written) {
+                client.event('log', `決まったことを ${written} に書きました`);
+            }
             await git.commitAll(`${spec.ticket.key}: ${spec.ticket.title}`);
             if (await git.hasCommitsAhead()) {
                 await git.push();
@@ -135,6 +153,12 @@ export async function execute(spec, deps) {
         }
         await client.flush();
     }
+}
+/** 起動したときの回答と、この起動の中で受け取った回答を合わせて決定記録を書く（同じ質問は1つ） */
+async function writeDecisionsWith(repoDir, spec, received) {
+    const known = new Set((spec.decisions ?? []).map((d) => d.question));
+    const decisions = [...(spec.decisions ?? []), ...received.filter((d) => !known.has(d.question))];
+    return writeDecisions(repoDir, { ...spec, decisions });
 }
 function finishBody(spec, status, last, usage, elapsed, extra = {}) {
     return {

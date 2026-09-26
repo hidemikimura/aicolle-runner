@@ -59,13 +59,24 @@ export class Git {
 	 *
 	 * ブランチがすでにあれば（再開・差戻し）その続きから、無ければ既定ブランチから作る。
 	 */
-	async prepare(): Promise<'resumed' | 'created'> {
+	async prepare(): Promise<'resumed' | 'created' | 'recreated'> {
 		const { clone_url, branch, default_branch } = this.spec.repository;
 		await this.exec(['clone', '--no-tags', clone_url, this.dir]);
 		await this.git('config', 'user.name', 'aiColle AI');
 		await this.git('config', 'user.email', 'ai@aicolle.invalid');
 
 		const remote = await this.git('ls-remote', '--heads', 'origin', branch);
+
+		// 最初からやり直す: ブランチがあっても既定ブランチから作り直す。push はそのときの先頭を確かめて上書きする
+		if (this.spec.restart_from === 'goal') {
+			await this.git('checkout', '-B', branch, `origin/${default_branch}`);
+			if (remote) {
+				this.overwrite = remote.split(/\s+/)[0];
+				return 'recreated';
+			}
+			return 'created';
+		}
+
 		if (remote) {
 			await this.git('fetch', 'origin', `${branch}:refs/remotes/origin/${branch}`);
 			await this.git('checkout', '-B', branch, `origin/${branch}`);
@@ -92,7 +103,22 @@ export class Git {
 		return Number(count) > 0;
 	}
 
+	/** 作り直したブランチの、取ったときの先頭（上書きの push に使う。1回上書きしたら空に戻す） */
+	private overwrite = '';
+
+	/** 最初からやり直して、まだ上書きしていないか（変更が無くても push して、古いコミットを消す） */
+	needsOverwrite(): boolean {
+		return this.overwrite !== '';
+	}
+
 	async push(): Promise<void> {
-		await this.git('push', 'origin', `HEAD:refs/heads/${this.spec.repository.branch}`);
+		const { branch } = this.spec.repository;
+		if (this.overwrite) {
+			// 取ったあとで誰かが push していたら上書きしない（--force-with-lease）
+			await this.git('push', `--force-with-lease=refs/heads/${branch}:${this.overwrite}`, 'origin', `HEAD:refs/heads/${branch}`);
+			this.overwrite = '';
+			return;
+		}
+		await this.git('push', 'origin', `HEAD:refs/heads/${branch}`);
 	}
 }
