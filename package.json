@@ -1,0 +1,22 @@
+{
+  "name": "aicolle-runner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "aiColle の AI 実行ランナー（サンドボックスの中で Claude Agent SDK を動かす）",
+  "main": "dist/src/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.282"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.3"
+  }
+}

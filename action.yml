@@ -1,0 +1,32 @@
+# aiColle ランナーの GitHub Action（docs/design/github-actions-runner.md）
+#
+# このディレクトリ（runner/）を公開リポジトリ（例: ecx/aicolle-runner）として置き、
+# 利用者のワークフローから `uses: ecx/aicolle-runner@v1` で呼ぶ。
+name: aiColle runner
+description: aiColle のチケットを Claude Agent SDK で進める（aiColle が workflow_dispatch で起こしたジョブの中で使う）
+inputs:
+  run_id:
+    description: aiColle の実行 ID
+    required: true
+  nonce:
+    description: aiColle が出した合言葉
+    required: true
+  server:
+    description: aiColle の URL
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: ランナーを用意する
+      shell: bash
+      run: |
+        cd "$GITHUB_ACTION_PATH"
+        npm ci --no-audit --no-fund
+        npm run build
+    - name: aiColle の作業をする
+      shell: bash
+      env:
+        AICOLLE_RUN_ID: ${{ inputs.run_id }}
+        AICOLLE_NONCE: ${{ inputs.nonce }}
+        AICOLLE_SERVER: ${{ inputs.server }}
+      run: node "$GITHUB_ACTION_PATH/dist/src/actions.js"
