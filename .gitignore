@@ -1,0 +1,13 @@
+# フロントエンド
+dist/
+node_modules/
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# 秘密（GitHub App の秘密鍵など）
+*.pem
+.env

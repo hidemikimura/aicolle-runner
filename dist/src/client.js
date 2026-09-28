@@ -1,9 +1,4 @@
 import { AicolleMcp } from './mcp-bridge.js';
-/**
- * サーバーへの呼び戻し（docs/design/ai-run.md「ランナーとの約束」）
- *
- * 出来事はためて 1 秒ごとにまとめて送る。送れなかったものは次にまとめて送り直す。
- */
 export class AicolleClient {
     fetchFn;
     base;
@@ -76,6 +71,10 @@ export class AicolleClient {
                 await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
             }
         }
+    }
+    /** 提出前チェック（push したあと、PR を作る前）。problems が空なら通った */
+    async presubmit(summary) {
+        return (await this.request('POST', `/runner/runs/${this.runId}/presubmit`, { summary }));
     }
     async appendSession(sessionId, subpath, entries) {
         await this.request('POST', `/runner/sessions/${encodeURIComponent(sessionId)}`, { subpath, entries });
