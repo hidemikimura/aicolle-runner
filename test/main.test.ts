@@ -589,3 +589,13 @@ test('レビュー役の返事を読めなければ、レビューなしで PR �
 	assert.equal(none.length, 0);
 	off.close();
 });
+
+test('完了の条件の対応表: 提出前チェックが返した表を、通っても PR の本文の最初に足す', async () => {
+	const table = '### 完了の条件の対応表\n\n| # | 完了の条件 | 確かめたもの |\n| --- | --- | --- |\n| 1 | 空で 422 | `LoginTest` |';
+	const server = await fakeServer({ presubmit: () => ({ problems: [], prompt: '', pr_note: '', conditions_note: table }) });
+	const body = await execute(spec(server.base, origin(), { ai: { ...spec('', '').ai, presubmit: true, presubmit_retries: 1 } }), { queryFn: fakeQuery([]), pollMs: 50 });
+	assert.equal(body.status, 'succeeded');
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.match(pr!.body.body, /^まとめ 1\n\n### 完了の条件の対応表\n\n\| # \| 完了の条件 \| 確かめたもの \|[\s\S]*\| 1 \| 空で 422 \| `LoginTest` \|\n---/);
+	server.close();
+});

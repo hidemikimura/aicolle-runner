@@ -40,6 +40,8 @@ export interface PresubmitResult {
 	prompt: string;
 	/** 直しきれなかったときに PR の本文に足す文 */
 	pr_note: string;
+	/** 完了の条件の対応表（通っても PR の本文に足す。古いサーバーは送らない。docs/design/conditions.md） */
+	conditions_note?: string;
 }
 
 export class AicolleClient {

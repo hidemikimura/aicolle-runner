@@ -199,7 +199,7 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 					last = checked.last;
 				}
 				summary = checked.summary;
-				const notes = [reviewed.note, checked.note].filter((n) => n).map((n) => n.trimEnd() + '\n').join('\n');
+				const notes = [checked.conditions, reviewed.note, checked.note].filter((n) => n).map((n) => n.trimEnd() + '\n').join('\n');
 				prNumber = await ensurePullRequest(
 					spec,
 					`${spec.ticket.key}: ${spec.ticket.title}`,
@@ -321,11 +321,12 @@ async function presubmit(
 	summary: string,
 	fix: (prompt: string) => Promise<AgentResult>,
 	abort: AbortController,
-): Promise<{ summary: string; note: string; last: AgentResult | null }> {
+): Promise<{ summary: string; note: string; conditions: string; last: AgentResult | null }> {
 	let current = summary;
 	let last: AgentResult | null = null;
+	let conditions = '';
 	if (!spec.ai.presubmit) {
-		return { summary: current, note: '', last };
+		return { summary: current, note: '', conditions, last };
 	}
 	const retries = Math.max(0, spec.ai.presubmit_retries ?? 0);
 	for (let attempt = 0; ; attempt++) {
@@ -334,20 +335,21 @@ async function presubmit(
 			result = await client.presubmit(current);
 		} catch (error) {
 			client.event('log', `提出前チェックを呼べなかったので、そのまま PR を作ります（${error instanceof Error ? error.message : String(error)}）`);
-			return { summary: current, note: '', last };
+			return { summary: current, note: '', conditions, last };
 		}
+		conditions = result.conditions_note ?? '';
 		if (result.problems.length === 0) {
 			client.event('log', attempt === 0 ? '提出前チェックを通りました' : '直して、提出前チェックを通りました');
-			return { summary: current, note: '', last };
+			return { summary: current, note: '', conditions, last };
 		}
 		if (attempt >= retries || abort.signal.aborted) {
 			client.event('log', '提出前チェックで残ったものを PR の本文に書きます');
-			return { summary: current, note: result.pr_note, last };
+			return { summary: current, note: result.pr_note, conditions, last };
 		}
 		client.event('log', `提出前チェックで見つかったものを直します（${result.problems.map((p) => p.label).join('・')}）`);
 		const fixed = await fix(result.prompt);
 		if (abort.signal.aborted || fixed.isError) {
-			return { summary: current, note: result.pr_note, last };
+			return { summary: current, note: result.pr_note, conditions, last };
 		}
 		last = fixed;
 		current = fixed.resultText?.trim() || current;
