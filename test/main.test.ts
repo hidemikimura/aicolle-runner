@@ -18,6 +18,8 @@ async function fakeServer(handlers: {
 	state?: () => object;
 	/** 提出前チェックの応答（既定は通る） */
 	presubmit?: (body: any) => object;
+	/** レビューの指摘を受けたときの応答（既定は直すべきもの無し） */
+	review?: (body: any) => object;
 	/** /runner/mcp の応答を差し替える（既定は jimble-mcp と同じ確かめ方をするふり） */
 	mcp?: (req: IncomingMessage, body: any) => { status: number; value: object };
 }) {
@@ -36,6 +38,7 @@ async function fakeServer(handlers: {
 			return json(value, status);
 		}
 		if (req.url!.endsWith('/presubmit')) return json(handlers.presubmit?.(body) ?? { problems: [], prompt: '', pr_note: '' });
+		if (req.url!.endsWith('/review')) return json(handlers.review?.(body) ?? { must: 0, prompt: '', pr_note: '' });
 		if (req.url!.endsWith('/state')) return json(handlers.state?.() ?? { status: 'running', cancel_requested: false, pending_questions: 0, answers: [] });
 		if (req.url!.startsWith('/repos/') && req.method === 'GET') return json([] as unknown as object);
 		if (req.url!.startsWith('/repos/') && req.method === 'POST') return json({ number: 42 }, 201);
@@ -486,4 +489,103 @@ test('直す回数を使い切ったら、残ったものを PR の本文に書�
 	await execute(spec(old.base, origin()), { queryFn: fakeQuery([]), pollMs: 50 });
 	assert.ok(!old.calls.some((c) => c.path.endsWith('/presubmit')));
 	old.close();
+});
+
+/** 作業する側は fakeQuery、レビュー役（書き換える道具を持たない）は reviews の順に返す */
+function withReviewer(prompts: { prompt: string; resume?: string }[], reviews: string[], seen: { prompt: string; options: any }[]): QueryFn {
+	const work = fakeQuery(prompts);
+	return async function* (params) {
+		if (params.options?.disallowedTools?.includes('Write')) {
+			seen.push({ prompt: params.prompt, options: params.options });
+			yield {
+				type: 'assistant',
+				session_id: `review-${seen.length}`,
+				message: { content: [{ type: 'tool_use', id: 'r1', name: 'Bash', input: { command: 'git diff origin/main...HEAD' } }] },
+			} as unknown as SDKMessage;
+			yield {
+				type: 'result',
+				subtype: 'success',
+				is_error: false,
+				result: reviews[seen.length - 1] ?? '',
+				session_id: `review-${seen.length}`,
+				total_cost_usd: 0.05,
+				usage: { input_tokens: 50, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+			} as unknown as SDKMessage;
+			return;
+		}
+		yield* work(params);
+	};
+}
+
+test('レビュー役の AI: 別のセッションでレビューし、直すべきものは作業したセッションに直させて、もう一度レビューする', async () => {
+	const reviews: any[] = [];
+	const server = await fakeServer({
+		review: (body) => {
+			reviews.push(body);
+			return body.round === 1
+				? { must: 1, prompt: '直して: レビュー', pr_note: '### AI のレビュー（1 回）' }
+				: { must: 0, prompt: '', pr_note: '### AI のレビュー（別のセッション・2 回）\n\n指摘はありませんでした。' };
+		},
+	});
+	const bare = origin();
+	const prompts: { prompt: string; resume?: string }[] = [];
+	const seen: { prompt: string; options: any }[] = [];
+	const first = '所感です。\n\n```json\n{"findings": [{"severity": "must", "title": "空のとき落ちる", "detail": "null を見ていない", "file": "src/A.java", "line": 3}, {"severity": "nit", "title": "名前"}]}\n```';
+	const second = '```json\n{"findings": []}\n```';
+
+	const body = await execute(
+		spec(server.base, bare, { ai: { ...spec('', '').ai, max_budget_usd: 5, review: { prompt: 'レビューして', retries: 1 } } }),
+		{ queryFn: withReviewer(prompts, [first, second], seen), pollMs: 50 },
+	);
+
+	assert.equal(body.status, 'succeeded');
+	// レビュー役は新しいセッション（resume 無し）・書き換える道具と aiColle のツールを持たない
+	assert.equal(seen.length, 2);
+	assert.equal(seen[0].prompt, 'レビューして');
+	assert.equal(seen[0].options.resume, undefined);
+	assert.equal(seen[0].options.mcpServers, undefined);
+	assert.deepEqual(seen[0].options.disallowedTools, ['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+	assert.equal(seen[0].options.env.AICOLLE_AGENT, 'runner');
+	// 直すのは作業したセッション
+	assert.equal(prompts.length, 2);
+	assert.equal(prompts[1].prompt, '直して: レビュー');
+	assert.equal(prompts[1].resume, 'sess-1');
+	// 送った指摘
+	assert.equal(reviews.length, 2);
+	assert.equal(reviews[0].round, 1);
+	assert.equal(reviews[0].fixed_earlier, 0);
+	assert.deepEqual(reviews[0].findings.map((f: any) => [f.severity, f.title, f.file, f.line]), [['must', '空のとき落ちる', 'src/A.java', 3], ['nit', '名前', '', 0]]);
+	assert.equal(reviews[1].round, 2);
+	assert.equal(reviews[1].fixed_earlier, 1);
+	// PR の本文には最後のレビューの節。直したコミットも push されている
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.match(pr!.body.body, /^まとめ 2\n\n### AI のレビュー（別のセッション・2 回）\n\n指摘はありませんでした。\n---/);
+	const log = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'aicolle/PM-1']).toString();
+	assert.match(log, /レビューで直すべきと言われたものを直す/);
+	// レビュー役の道具は「実行: 」で始めない（テストを流した記録にしない）。原価は足す
+	const tools = server.calls.filter((c) => c.path.endsWith('/events')).flatMap((c) => c.body.events ?? [c.body]).filter((e: any) => e.kind === 'tool');
+	assert.ok(tools.some((e: any) => e.message === 'レビュー: 実行: git diff origin/main...HEAD'), JSON.stringify(tools));
+	assert.ok(Math.abs(body.usage!.cost_usd - (0.2 + 0.1)) < 1e-9, String(body.usage!.cost_usd));
+	server.close();
+});
+
+test('レビュー役の返事を読めなければ、レビューなしで PR を作る。設定が無ければレビューしない', async () => {
+	const server = await fakeServer({});
+	const seen: { prompt: string; options: any }[] = [];
+	const body = await execute(
+		spec(server.base, origin(), { ai: { ...spec('', '').ai, review: { prompt: 'レビューして', retries: 1 } } }),
+		{ queryFn: withReviewer([], ['よさそうです'], seen), pollMs: 50 },
+	);
+	assert.equal(body.status, 'succeeded');
+	assert.equal(seen.length, 1);
+	assert.ok(!server.calls.some((c) => c.path.endsWith('/review')));
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.doesNotMatch(pr!.body.body, /AI のレビュー/);
+	server.close();
+
+	const off = await fakeServer({});
+	const none: { prompt: string; options: any }[] = [];
+	await execute(spec(off.base, origin()), { queryFn: withReviewer([], [], none), pollMs: 50 });
+	assert.equal(none.length, 0);
+	off.close();
 });

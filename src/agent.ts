@@ -32,6 +32,9 @@ export function sessionStore(client: AicolleClient): SessionStore {
 	};
 }
 
+/** 動かし方。review = レビュー役（別のセッション・ファイルを変えない・aiColle のツールを持たない。docs/design/ai-review.md） */
+export type AgentMode = { kind: 'work' } | { kind: 'review'; maxBudgetUsd: number | null };
+
 /**
  * エージェントを1回動かす
  */
@@ -42,7 +45,12 @@ export async function runAgent(
 	input: { prompt: string; resume?: string },
 	queryFn: QueryFn,
 	abortController: AbortController,
+	mode: AgentMode = { kind: 'work' },
 ): Promise<AgentResult> {
+	if (mode.kind === 'review') {
+		return runReviewer(spec, client, cwd, input.prompt, queryFn, abortController, mode.maxBudgetUsd);
+	}
+
 	// aiColle のツールは橋渡しを通す（SDK の MCP クライアントは aiColle の版を話せない。mcp-bridge.ts）
 	// 一覧を取れなければここで投げて、ツールの無いまま動かさない
 	const aicolle = await aicolleMcpServer(client.mcp(spec.mcp.url));
@@ -124,6 +132,64 @@ export async function runAgent(
 		}
 	}
 
+	return result;
+}
+
+/**
+ * レビュー役を 1 回動かす（新しいセッション。書き換える道具・aiColle のツール・セッションの写しを持たない）
+ */
+async function runReviewer(
+	spec: RunSpec,
+	client: AicolleClient,
+	cwd: string,
+	prompt: string,
+	queryFn: QueryFn,
+	abortController: AbortController,
+	maxBudgetUsd: number | null,
+): Promise<AgentResult> {
+	const options: Options = {
+		cwd,
+		abortController,
+		settingSources: ['project'],
+		systemPrompt: {
+			type: 'preset',
+			preset: 'claude_code',
+			append:
+				'あなたは aiColle のサンドボックスの中で、別の AI が作った差分をレビューする役として動いている。' +
+				'ファイルを変えない・コミットしない・push しない。人には質問できない。指摘は日本語で書き、最後に指示された形の JSON を返す。',
+		},
+		permissionMode: 'bypassPermissions',
+		allowDangerouslySkipPermissions: true,
+		disallowedTools: ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'],
+		...(spec.ai.model ? { model: spec.ai.model } : {}),
+		...(maxBudgetUsd != null ? { maxBudgetUsd: Math.max(0.01, maxBudgetUsd) } : {}),
+		stderr: (data: string) => process.stderr.write(data),
+		env: { ...process.env, AICOLLE_AGENT: 'runner' },
+	};
+
+	const result: AgentResult = { sessionId: '', resultText: '', totalCostUsd: 0, inputTokens: 0, outputTokens: 0, isError: false, subtype: '' };
+	for await (const message of queryFn({ prompt, options })) {
+		if ('session_id' in message && typeof message.session_id === 'string' && message.session_id) {
+			result.sessionId = message.session_id;
+		}
+		if (message.type === 'assistant') {
+			for (const block of message.message.content) {
+				if (block.type === 'tool_use') {
+					// 「実行: …」で始めない（提出前チェックがテストを流した記録と数えないように）
+					client.event('tool', `レビュー: ${describeTool(block.name, block.input)}`, { tool: block.name, reviewer: true });
+				}
+			}
+		}
+		if (message.type === 'result') {
+			result.totalCostUsd = message.total_cost_usd ?? 0;
+			result.inputTokens = (message.usage?.input_tokens ?? 0) + (message.usage?.cache_read_input_tokens ?? 0)
+				+ (message.usage?.cache_creation_input_tokens ?? 0);
+			result.outputTokens = message.usage?.output_tokens ?? 0;
+			result.isError = message.is_error;
+			result.subtype = message.subtype;
+			result.resultText = message.subtype === 'success' ? message.result : '';
+		}
+	}
 	return result;
 }
 

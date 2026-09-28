@@ -15,6 +15,25 @@ export interface RunState {
  * 出来事はためて 1 秒ごとにまとめて送る。送れなかったものは次にまとめて送り直す。
  */
 /** 提出前チェックの結果 */
+/** レビュー役の指摘を送った結果（docs/design/ai-review.md） */
+export interface ReviewResult {
+	/** 直すべき指摘の数 */
+	must: number;
+	/** 直させるときに作業したセッションに渡す文 */
+	prompt: string;
+	/** PR の本文に足す文 */
+	pr_note: string;
+}
+
+/** レビュー役の指摘 */
+export interface ReviewFinding {
+	severity: string;
+	title: string;
+	detail?: string;
+	file?: string;
+	line?: number;
+}
+
 export interface PresubmitResult {
 	problems: { key: string; label: string; message: string; files: string[] }[];
 	/** 直させるときにエージェントに渡す文 */
@@ -103,6 +122,11 @@ export class AicolleClient {
 	/** 提出前チェック（push したあと、PR を作る前）。problems が空なら通った */
 	async presubmit(summary: string): Promise<PresubmitResult> {
 		return (await this.request('POST', `/runner/runs/${this.runId}/presubmit`, { summary })) as PresubmitResult;
+	}
+
+	/** レビュー役の指摘を送る（round は 1 から。fixed_earlier は前のレビューで直させた数） */
+	async review(round: number, findings: ReviewFinding[], fixedEarlier: number): Promise<ReviewResult> {
+		return (await this.request('POST', `/runner/runs/${this.runId}/review`, { round, findings, fixed_earlier: fixedEarlier })) as ReviewResult;
 	}
 
 	async appendSession(sessionId: string, subpath: string, entries: unknown[]): Promise<void> {

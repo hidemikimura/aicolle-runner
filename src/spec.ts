@@ -39,6 +39,8 @@ export interface RunSpec {
 		presubmit?: boolean;
 		/** 提出前チェックで見つかったものをエージェントに直させる回数 */
 		presubmit_retries?: number;
+		/** レビュー役の AI（PR を作る前に別のセッションで差分をレビューさせる。null・無し = しない。docs/design/ai-review.md） */
+		review?: { prompt: string; retries: number } | null;
 	};
 	question_wait_seconds: number;
 	/** 回答の出た判断依頼（決定記録として {docs_root}/decisions/{キー}.md に書く。古いサーバーは送らない） */

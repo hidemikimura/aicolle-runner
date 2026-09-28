@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AicolleClient, type RunState } from './client.js';
 import { runAgent, type AgentResult, type QueryFn } from './agent.js';
+import { parseFindings } from './review.js';
 import { Git } from './git.js';
 import { ensurePullRequest } from './github.js';
 import { writeDecisions } from './decisions.js';
@@ -25,8 +26,9 @@ export interface Deps {
  * 2. エージェントを動かす（再開なら回答を渡して resume）
  * 3. 質問が残っていれば question_wait だけ待つ。回答が来たら resume、来なければ WIP を push して waiting_answer
  * 4. 変更をコミットして push する
- * 5. 提出前チェック（aiColle が GitHub のブランチを見る）。見つかれば presubmit_retries 回までエージェントに直させて push し直す
- * 6. PR を作って succeeded（直しきれなかったものは PR の本文に書く）
+ * 5. レビュー役の AI（設定でオンのとき）。別のセッションで差分をレビューし、直すべきものは review.retries 回まで直させて push し直す
+ * 6. 提出前チェック（aiColle が GitHub のブランチを見る）。見つかれば presubmit_retries 回までエージェントに直させて push し直す
+ * 7. PR を作って succeeded（レビューの指摘・直しきれなかったものは PR の本文に書く）
  */
 export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 	const startedAt = Date.now();
@@ -40,11 +42,16 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 	let last: AgentResult | null = null;
 	const received: Decision[] = [];
 
+	// レビュー役（別のセッション）の分。作業したセッションの累計には入らないので足す
+	const reviewer = { costUsd: 0, inputTokens: 0, outputTokens: 0 };
 	const usage = () => ({
-		input_tokens: last?.inputTokens ?? 0,
-		output_tokens: last?.outputTokens ?? 0,
-		cost_usd: Math.max(0, (last?.totalCostUsd ?? 0) - baselineCost),
+		input_tokens: (last?.inputTokens ?? 0) + reviewer.inputTokens,
+		output_tokens: (last?.outputTokens ?? 0) + reviewer.outputTokens,
+		cost_usd: Math.max(0, (last?.totalCostUsd ?? 0) - baselineCost) + reviewer.costUsd,
 	});
+
+	// レビュー役に使ってよい原価（予算の上限があれば、その残り）
+	const reviewBudget = () => (spec.ai.max_budget_usd == null ? null : Math.max(0, spec.ai.max_budget_usd - usage().cost_usd));
 
 	// 中断の指示を見張る
 	const watcher = setInterval(() => {
@@ -178,15 +185,25 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 				client.event('log', '変更はありませんでした（ブランチを既定ブランチに戻しました）');
 			} else if (await git.hasCommitsAhead()) {
 				await git.push();
-				const checked = await presubmit(spec, client, git, summary, (prompt) => runAgent(spec, client, repoDir, { prompt, resume: last?.sessionId }, deps.queryFn, abort), abort);
+				const fix = (prompt: string) => runAgent(spec, client, repoDir, { prompt, resume: last?.sessionId }, deps.queryFn, abort);
+				// レビュー役の AI（別のセッション）。直すべきものは作業したセッションに直させる（docs/design/ai-review.md）
+				const reviewed = await review(spec, client, git, summary, fix
+					, (prompt) => runAgent(spec, client, repoDir, { prompt }, deps.queryFn, abort, { kind: 'review', maxBudgetUsd: reviewBudget() })
+					, reviewer, abort);
+				if (reviewed.last) {
+					last = reviewed.last;
+				}
+				summary = reviewed.summary;
+				const checked = await presubmit(spec, client, git, summary, fix, abort);
 				if (checked.last) {
 					last = checked.last;
 				}
 				summary = checked.summary;
+				const notes = [reviewed.note, checked.note].filter((n) => n).map((n) => n.trimEnd() + '\n').join('\n');
 				prNumber = await ensurePullRequest(
 					spec,
 					`${spec.ticket.key}: ${spec.ticket.title}`,
-					`${summary}\n\n${checked.note ? checked.note + '\n' : ''}---\naiColle のチケット ${spec.ticket.key} から AI が作りました。`,
+					`${summary}\n\n${notes}---\naiColle のチケット ${spec.ticket.key} から AI が作りました。`,
 					deps.fetchFn,
 				);
 				client.event('pr', `PR #${prNumber} を作りました`, { pr_number: prNumber });
@@ -213,6 +230,81 @@ async function writeDecisionsWith(repoDir: string, spec: RunSpec, received: Deci
 	const known = new Set((spec.decisions ?? []).map((d) => d.question));
 	const decisions = [...(spec.decisions ?? []), ...received.filter((d) => !known.has(d.question))];
 	return writeDecisions(repoDir, { ...spec, decisions });
+}
+
+/**
+ * レビュー役の AI（docs/design/ai-review.md）
+ *
+ * 別のセッション（まっさらな文脈・ファイルを変えない）にチケットと差分だけを読ませて指摘を受け取り、aiColle に送る。
+ * 直すべき（must）があれば review.retries 回まで作業したセッションに直させ、コミットして push し、新しいセッションでもう一度レビューする。
+ * レビュー役が失敗した・返事を読めなかったときは止めずに進める（PR の本文にも書かない）。
+ */
+async function review(
+	spec: RunSpec,
+	client: AicolleClient,
+	git: Git,
+	summary: string,
+	fix: (prompt: string) => Promise<AgentResult>,
+	reviewAgent: (prompt: string) => Promise<AgentResult>,
+	reviewer: { costUsd: number; inputTokens: number; outputTokens: number },
+	abort: AbortController,
+): Promise<{ summary: string; note: string; last: AgentResult | null }> {
+	let current = summary;
+	let last: AgentResult | null = null;
+	const config = spec.ai.review;
+	if (!config?.prompt) {
+		return { summary: current, note: '', last };
+	}
+	const retries = Math.max(0, config.retries ?? 0);
+	let note = '';
+	let fixedEarlier = 0;
+	for (let round = 1; ; round++) {
+		if (abort.signal.aborted) {
+			return { summary: current, note, last };
+		}
+		client.event('log', round === 1 ? '別のセッションで差分をレビューします' : `直したので、別のセッションでもう一度レビューします（${round} 回目）`);
+		let result: AgentResult;
+		try {
+			result = await reviewAgent(config.prompt);
+		} catch (error) {
+			client.event('log', `レビュー役を動かせなかったので、レビューなしで進めます（${error instanceof Error ? error.message : String(error)}）`);
+			return { summary: current, note, last };
+		}
+		reviewer.costUsd += result.totalCostUsd;
+		reviewer.inputTokens += result.inputTokens;
+		reviewer.outputTokens += result.outputTokens;
+		if (abort.signal.aborted) {
+			return { summary: current, note, last };
+		}
+		const findings = result.isError ? null : parseFindings(result.resultText);
+		if (findings === null) {
+			client.event('log', result.isError ? `レビュー役が失敗したので、レビューなしで進めます（${result.subtype}）` : 'レビュー役の返事を読めなかったので、レビューなしで進めます');
+			return { summary: current, note, last };
+		}
+		let answer;
+		try {
+			answer = await client.review(round, findings, fixedEarlier);
+		} catch (error) {
+			client.event('log', `レビューの結果を送れなかったので、そのまま進めます（${error instanceof Error ? error.message : String(error)}）`);
+			return { summary: current, note, last };
+		}
+		note = answer.pr_note;
+		if (answer.must === 0 || round > retries) {
+			client.event('log', answer.must === 0 ? 'レビューで直すべきものはありませんでした' : 'レビューで直すべきと言われて残ったものを PR の本文に書きます');
+			return { summary: current, note, last };
+		}
+		client.event('log', `レビューで直すべきと言われた ${answer.must} 件を直します`);
+		const fixed = await fix(answer.prompt);
+		if (abort.signal.aborted || fixed.isError) {
+			return { summary: current, note, last };
+		}
+		last = fixed;
+		current = fixed.resultText?.trim() || current;
+		fixedEarlier += answer.must;
+		if (await git.commitAll(`${spec.ticket.key}: レビューで直すべきと言われたものを直す`)) {
+			await git.push();
+		}
+	}
 }
 
 /**
