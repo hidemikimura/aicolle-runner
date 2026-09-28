@@ -77,6 +77,8 @@ export async function runAgent(
 		...(spec.ai.max_budget_usd != null ? { maxBudgetUsd: Math.max(0.01, spec.ai.max_budget_usd) } : {}),
 		...(input.resume ? { resume: input.resume } : {}),
 		stderr: (data: string) => process.stderr.write(data),
+		// リポジトリの hooks（aiColle が配るもの。docs/design/claude-hooks.md）が、サーバーの AI の中だと分かるように
+		env: { ...process.env, AICOLLE_AGENT: 'runner' },
 	};
 
 	const result: AgentResult = {

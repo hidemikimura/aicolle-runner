@@ -14,6 +14,15 @@ export interface RunState {
  *
  * 出来事はためて 1 秒ごとにまとめて送る。送れなかったものは次にまとめて送り直す。
  */
+/** 提出前チェックの結果 */
+export interface PresubmitResult {
+	problems: { key: string; label: string; message: string; files: string[] }[];
+	/** 直させるときにエージェントに渡す文 */
+	prompt: string;
+	/** 直しきれなかったときに PR の本文に足す文 */
+	pr_note: string;
+}
+
 export class AicolleClient {
 	private readonly base: string;
 	private readonly token: string;
@@ -89,6 +98,11 @@ export class AicolleClient {
 				await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
 			}
 		}
+	}
+
+	/** 提出前チェック（push したあと、PR を作る前）。problems が空なら通った */
+	async presubmit(summary: string): Promise<PresubmitResult> {
+		return (await this.request('POST', `/runner/runs/${this.runId}/presubmit`, { summary })) as PresubmitResult;
 	}
 
 	async appendSession(sessionId: string, subpath: string, entries: unknown[]): Promise<void> {

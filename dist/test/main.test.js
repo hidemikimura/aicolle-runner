@@ -341,4 +341,27 @@ test('乖離の見回り（audit）はファイルを書き換える道具を渡
     assert.equal(server.calls.filter((c) => c.path === '/repos/ecx/sample/pulls').length, 0);
     server.close();
 });
+test('最初からやり直す（restart_from = goal）と、ブランチを既定ブランチから作り直して上書きする', async (t) => {
+    const server = await fakeServer({});
+    t.after(() => server.close());
+    const bare = origin();
+    const first = await execute(spec(server.base, bare), { queryFn: fakeQuery([]), pollMs: 50 });
+    assert.equal(first.status, 'succeeded');
+    const old = execFileSync('git', ['--git-dir', bare, 'rev-parse', 'aicolle/PM-1']).toString().trim();
+    const events = [];
+    const body = await execute(spec(server.base, bare, { restart_from: 'goal', prompt: '最初からやり直して' }), { queryFn: fakeQuery([]), pollMs: 50 });
+    assert.equal(body.status, 'succeeded');
+    server.calls.filter((c) => c.path.endsWith('/events')).flatMap((c) => c.body.events).forEach((e) => events.push(e.message));
+    assert.ok(events.some((m) => m.includes('既定ブランチから作り直しました')), events.join('\n'));
+    // 新しいブランチは既定ブランチから1コミットだけ。前のコミットは残っていない
+    const now = execFileSync('git', ['--git-dir', bare, 'rev-parse', 'aicolle/PM-1']).toString().trim();
+    assert.notEqual(now, old);
+    const ahead = execFileSync('git', ['--git-dir', bare, 'rev-list', '--count', 'main..aicolle/PM-1']).toString().trim();
+    assert.equal(ahead, '1');
+    assert.throws(() => execFileSync('git', ['--git-dir', bare, 'merge-base', '--is-ancestor', old, now], { stdio: 'pipe' }));
+    // 続きから（restart_from 無し）なら前のコミットの上に積む
+    await execute(spec(server.base, bare), { queryFn: fakeQuery([]), pollMs: 50 });
+    const next = execFileSync('git', ['--git-dir', bare, 'rev-parse', 'aicolle/PM-1']).toString().trim();
+    execFileSync('git', ['--git-dir', bare, 'merge-base', '--is-ancestor', now, next]);
+});
 //# sourceMappingURL=main.test.js.map

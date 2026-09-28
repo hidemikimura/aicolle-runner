@@ -16,6 +16,8 @@ import type { RunSpec } from '../src/spec.js';
 /** サーバー（aiColle と GitHub の両方のふりをする） */
 async function fakeServer(handlers: {
 	state?: () => object;
+	/** 提出前チェックの応答（既定は通る） */
+	presubmit?: (body: any) => object;
 	/** /runner/mcp の応答を差し替える（既定は jimble-mcp と同じ確かめ方をするふり） */
 	mcp?: (req: IncomingMessage, body: any) => { status: number; value: object };
 }) {
@@ -33,6 +35,7 @@ async function fakeServer(handlers: {
 			const { status, value } = (handlers.mcp ?? fakeMcp)(req, body);
 			return json(value, status);
 		}
+		if (req.url!.endsWith('/presubmit')) return json(handlers.presubmit?.(body) ?? { problems: [], prompt: '', pr_note: '' });
 		if (req.url!.endsWith('/state')) return json(handlers.state?.() ?? { status: 'running', cancel_requested: false, pending_questions: 0, answers: [] });
 		if (req.url!.startsWith('/repos/') && req.method === 'GET') return json([] as unknown as object);
 		if (req.url!.startsWith('/repos/') && req.method === 'POST') return json({ number: 42 }, 201);
@@ -434,4 +437,53 @@ test('最初からやり直す（restart_from = goal）と、ブランチを既�
 	await execute(spec(server.base, bare), { queryFn: fakeQuery([]), pollMs: 50 });
 	const next = execFileSync('git', ['--git-dir', bare, 'rev-parse', 'aicolle/PM-1']).toString().trim();
 	execFileSync('git', ['--git-dir', bare, 'merge-base', '--is-ancestor', now, next]);
+});
+
+const docsProblem = { key: 'docs', label: 'docs の直し漏れ', message: 'docs を直していません', files: ['src/A.java'] };
+
+test('提出前チェックで見つかれば、同じセッションで直させて push し直し、通れば PR の本文には何も足さない', async () => {
+	let checks = 0;
+	const server = await fakeServer({
+		presubmit: () => (++checks === 1 ? { problems: [docsProblem], prompt: '直して: docs', pr_note: '### 残ったもの' } : { problems: [], prompt: '', pr_note: '' }),
+	});
+	const bare = origin();
+	const prompts: { prompt: string; resume?: string }[] = [];
+
+	const body = await execute(spec(server.base, bare, { ai: { ...spec('', '').ai, presubmit: true, presubmit_retries: 1 } }), { queryFn: fakeQuery(prompts), pollMs: 50 });
+
+	assert.equal(body.status, 'succeeded');
+	assert.equal(checks, 2);
+	assert.equal(prompts.length, 2);
+	assert.equal(prompts[1].prompt, '直して: docs');
+	assert.equal(prompts[1].resume, 'sess-1');
+	// 直したあとのまとめが PR の本文になり、直したコミットも push されている
+	assert.equal(body.summary, 'まとめ 2');
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.match(pr!.body.body, /^まとめ 2/);
+	assert.doesNotMatch(pr!.body.body, /残ったもの/);
+	const log = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'aicolle/PM-1']).toString();
+	assert.match(log, /提出前チェックで見つかったものを直す/);
+	// 最初のチェックにはエージェントのまとめを渡す
+	assert.equal(server.calls.find((c) => c.path.endsWith('/presubmit'))!.body.summary, 'まとめ 1');
+
+	server.close();
+});
+
+test('直す回数を使い切ったら、残ったものを PR の本文に書く。チェックを頼まない古いサーバーでは呼ばない', async () => {
+	const server = await fakeServer({ presubmit: () => ({ problems: [docsProblem], prompt: '直して', pr_note: '### 提出前チェックで残ったもの' }) });
+	const prompts: { prompt: string; resume?: string }[] = [];
+
+	const body = await execute(spec(server.base, origin(), { ai: { ...spec('', '').ai, presubmit: true, presubmit_retries: 0 } }), { queryFn: fakeQuery(prompts), pollMs: 50 });
+
+	assert.equal(body.status, 'succeeded');
+	assert.equal(prompts.length, 1);
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.match(pr!.body.body, /### 提出前チェックで残ったもの\n---/);
+	server.close();
+
+	// presubmit を送らない（古い）サーバーでは呼ばない
+	const old = await fakeServer({});
+	await execute(spec(old.base, origin()), { queryFn: fakeQuery([]), pollMs: 50 });
+	assert.ok(!old.calls.some((c) => c.path.endsWith('/presubmit')));
+	old.close();
 });

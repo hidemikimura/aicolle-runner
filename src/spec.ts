@@ -35,6 +35,10 @@ export interface RunSpec {
 		max_test_retries: number;
 		time_limit_minutes: number;
 		test_command: string;
+		/** PR を作る前に提出前チェックを呼ぶか（古いサーバーは送らない = 呼ばない。docs/design/presubmit.md） */
+		presubmit?: boolean;
+		/** 提出前チェックで見つかったものをエージェントに直させる回数 */
+		presubmit_retries?: number;
 	};
 	question_wait_seconds: number;
 	/** 回答の出た判断依頼（決定記録として {docs_root}/decisions/{キー}.md に書く。古いサーバーは送らない） */

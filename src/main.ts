@@ -24,7 +24,9 @@ export interface Deps {
  * 1. リポジトリを取ってブランチに切り替える
  * 2. エージェントを動かす（再開なら回答を渡して resume）
  * 3. 質問が残っていれば question_wait だけ待つ。回答が来たら resume、来なければ WIP を push して waiting_answer
- * 4. 変更をコミットして push、PR を作って succeeded
+ * 4. 変更をコミットして push する
+ * 5. 提出前チェック（aiColle が GitHub のブランチを見る）。見つかれば presubmit_retries 回までエージェントに直させて push し直す
+ * 6. PR を作って succeeded（直しきれなかったものは PR の本文に書く）
  */
 export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 	const startedAt = Date.now();
@@ -155,7 +157,7 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 		}
 
 		// コミット・push・PR
-		const summary = last?.resultText?.trim() || '作業が終わりました';
+		let summary = last?.resultText?.trim() || '作業が終わりました';
 		let prNumber: number | undefined;
 
 		// 乖離の見回りは読むだけ。変更があっても（テストの生成物など）コミットも push もしない
@@ -176,10 +178,15 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 				client.event('log', '変更はありませんでした（ブランチを既定ブランチに戻しました）');
 			} else if (await git.hasCommitsAhead()) {
 				await git.push();
+				const checked = await presubmit(spec, client, git, summary, (prompt) => runAgent(spec, client, repoDir, { prompt, resume: last?.sessionId }, deps.queryFn, abort), abort);
+				if (checked.last) {
+					last = checked.last;
+				}
+				summary = checked.summary;
 				prNumber = await ensurePullRequest(
 					spec,
 					`${spec.ticket.key}: ${spec.ticket.title}`,
-					`${summary}\n\n---\naiColle のチケット ${spec.ticket.key} から AI が作りました。`,
+					`${summary}\n\n${checked.note ? checked.note + '\n' : ''}---\naiColle のチケット ${spec.ticket.key} から AI が作りました。`,
 					deps.fetchFn,
 				);
 				client.event('pr', `PR #${prNumber} を作りました`, { pr_number: prNumber });
@@ -206,6 +213,56 @@ async function writeDecisionsWith(repoDir: string, spec: RunSpec, received: Deci
 	const known = new Set((spec.decisions ?? []).map((d) => d.question));
 	const decisions = [...(spec.decisions ?? []), ...received.filter((d) => !known.has(d.question))];
 	return writeDecisions(repoDir, { ...spec, decisions });
+}
+
+/**
+ * 提出前チェック（docs/design/presubmit.md）
+ *
+ * aiColle が push したブランチを見て、docs の直し漏れ・まとめの言葉・決定記録・人が書いた段落・テストを確かめる。
+ * 見つかれば presubmit_retries 回までエージェントに直させ（同じセッションで続ける）、コミットして push し直す。
+ * チェックを呼べなかったときは止めずに PR を作る。
+ */
+async function presubmit(
+	spec: RunSpec,
+	client: AicolleClient,
+	git: Git,
+	summary: string,
+	fix: (prompt: string) => Promise<AgentResult>,
+	abort: AbortController,
+): Promise<{ summary: string; note: string; last: AgentResult | null }> {
+	let current = summary;
+	let last: AgentResult | null = null;
+	if (!spec.ai.presubmit) {
+		return { summary: current, note: '', last };
+	}
+	const retries = Math.max(0, spec.ai.presubmit_retries ?? 0);
+	for (let attempt = 0; ; attempt++) {
+		let result;
+		try {
+			result = await client.presubmit(current);
+		} catch (error) {
+			client.event('log', `提出前チェックを呼べなかったので、そのまま PR を作ります（${error instanceof Error ? error.message : String(error)}）`);
+			return { summary: current, note: '', last };
+		}
+		if (result.problems.length === 0) {
+			client.event('log', attempt === 0 ? '提出前チェックを通りました' : '直して、提出前チェックを通りました');
+			return { summary: current, note: '', last };
+		}
+		if (attempt >= retries || abort.signal.aborted) {
+			client.event('log', '提出前チェックで残ったものを PR の本文に書きます');
+			return { summary: current, note: result.pr_note, last };
+		}
+		client.event('log', `提出前チェックで見つかったものを直します（${result.problems.map((p) => p.label).join('・')}）`);
+		const fixed = await fix(result.prompt);
+		if (abort.signal.aborted || fixed.isError) {
+			return { summary: current, note: result.pr_note, last };
+		}
+		last = fixed;
+		current = fixed.resultText?.trim() || current;
+		if (await git.commitAll(`${spec.ticket.key}: 提出前チェックで見つかったものを直す`)) {
+			await git.push();
+		}
+	}
 }
 
 function finishBody(
