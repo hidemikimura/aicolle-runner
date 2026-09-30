@@ -8,7 +8,7 @@ import { parseFindings } from './review.js';
 import { Git } from './git.js';
 import { ensurePullRequest } from './github.js';
 import { writeDecisions } from './decisions.js';
-import type { Decision, FinishBody, RunSpec } from './spec.js';
+import type { Decision, FinishBody, ReviewStage, RunSpec } from './spec.js';
 
 /** 差し替えられる部品（テスト用） */
 export interface Deps {
@@ -26,7 +26,7 @@ export interface Deps {
  * 2. エージェントを動かす（再開なら回答を渡して resume）
  * 3. 質問が残っていれば question_wait だけ待つ。回答が来たら resume、来なければ WIP を push して waiting_answer
  * 4. 変更をコミットして push する
- * 5. レビュー役の AI（設定でオンのとき）。別のセッションで差分をレビューし、直すべきものは review.retries 回まで直させて push し直す
+ * 5. レビュー役の AI（設定でオンの段だけ。敵対的 → 通常の順）。段ごとに別のセッションで差分をレビューし、直すべきものは retries 回まで直させて push し直す
  * 6. 提出前チェック（aiColle が GitHub のブランチを見る）。見つかれば presubmit_retries 回までエージェントに直させて push し直す
  * 7. PR を作って succeeded（レビューの指摘・直しきれなかったものは PR の本文に書く）
  */
@@ -186,20 +186,27 @@ export async function execute(spec: RunSpec, deps: Deps): Promise<FinishBody> {
 			} else if (await git.hasCommitsAhead()) {
 				await git.push();
 				const fix = (prompt: string) => runAgent(spec, client, repoDir, { prompt, resume: last?.sessionId }, deps.queryFn, abort);
-				// レビュー役の AI（別のセッション）。直すべきものは作業したセッションに直させる（docs/design/ai-review.md）
-				const reviewed = await review(spec, client, git, summary, fix
-					, (prompt) => runAgent(spec, client, repoDir, { prompt }, deps.queryFn, abort, { kind: 'review', maxBudgetUsd: reviewBudget() })
-					, reviewer, abort);
-				if (reviewed.last) {
-					last = reviewed.last;
+				// レビュー役の AI（段ごとに別のセッション。敵対的 → 通常）。直すべきものは作業したセッションに直させる（docs/design/ai-review.md）
+				const reviewNotes: string[] = [];
+				for (const stage of reviewStages(spec)) {
+					const reviewed = await review(spec, stage, client, git, summary, fix
+						, (prompt) => runAgent(spec, client, repoDir, { prompt }, deps.queryFn, abort, { kind: 'review', maxBudgetUsd: reviewBudget() })
+						, reviewer, abort);
+					if (reviewed.last) {
+						last = reviewed.last;
+					}
+					summary = reviewed.summary;
+					if (reviewed.note) {
+						reviewNotes.push(reviewed.note);
+					}
 				}
-				summary = reviewed.summary;
+				const reviewedNote = reviewNotes.map((n) => n.trimEnd()).join('\n\n');
 				const checked = await presubmit(spec, client, git, summary, fix, abort);
 				if (checked.last) {
 					last = checked.last;
 				}
 				summary = checked.summary;
-				const notes = [checked.conditions, reviewed.note, checked.note].filter((n) => n).map((n) => n.trimEnd() + '\n').join('\n');
+				const notes = [checked.conditions, reviewedNote, checked.note].filter((n) => n).map((n) => n.trimEnd() + '\n').join('\n');
 				prNumber = await ensurePullRequest(
 					spec,
 					`${spec.ticket.key}: ${spec.ticket.title}`,
@@ -233,7 +240,17 @@ async function writeDecisionsWith(repoDir: string, spec: RunSpec, received: Deci
 }
 
 /**
- * レビュー役の AI（docs/design/ai-review.md）
+ * 行うレビューの段（サーバーの reviews。古いサーバーは review だけを送るので、それを通常のレビューとして使う）
+ */
+export function reviewStages(spec: RunSpec): ReviewStage[] {
+	if (Array.isArray(spec.ai.reviews)) {
+		return spec.ai.reviews.filter((stage) => stage?.prompt);
+	}
+	return spec.ai.review?.prompt ? [{ kind: 'standard', label: '通常のレビュー', prompt: spec.ai.review.prompt, retries: spec.ai.review.retries }] : [];
+}
+
+/**
+ * レビュー役の AI の 1 段（docs/design/ai-review.md）
  *
  * 別のセッション（まっさらな文脈・ファイルを変えない）にチケットと差分だけを読ませて指摘を受け取り、aiColle に送る。
  * 直すべき（must）があれば review.retries 回まで作業したセッションに直させ、コミットして push し、新しいセッションでもう一度レビューする。
@@ -241,6 +258,7 @@ async function writeDecisionsWith(repoDir: string, spec: RunSpec, received: Deci
  */
 async function review(
 	spec: RunSpec,
+	stage: ReviewStage,
 	client: AicolleClient,
 	git: Git,
 	summary: string,
@@ -251,23 +269,20 @@ async function review(
 ): Promise<{ summary: string; note: string; last: AgentResult | null }> {
 	let current = summary;
 	let last: AgentResult | null = null;
-	const config = spec.ai.review;
-	if (!config?.prompt) {
-		return { summary: current, note: '', last };
-	}
-	const retries = Math.max(0, config.retries ?? 0);
+	const label = stage.label || (stage.kind === 'adversarial' ? '敵対的レビュー' : '通常のレビュー');
+	const retries = Math.max(0, stage.retries ?? 0);
 	let note = '';
 	let fixedEarlier = 0;
 	for (let round = 1; ; round++) {
 		if (abort.signal.aborted) {
 			return { summary: current, note, last };
 		}
-		client.event('log', round === 1 ? '別のセッションで差分をレビューします' : `直したので、別のセッションでもう一度レビューします（${round} 回目）`);
+		client.event('log', round === 1 ? `別のセッションで差分の${label}をします` : `直したので、別のセッションでもう一度${label}をします（${round} 回目）`);
 		let result: AgentResult;
 		try {
-			result = await reviewAgent(config.prompt);
+			result = await reviewAgent(stage.prompt);
 		} catch (error) {
-			client.event('log', `レビュー役を動かせなかったので、レビューなしで進めます（${error instanceof Error ? error.message : String(error)}）`);
+			client.event('log', `${label}の役を動かせなかったので、${label}なしで進めます（${error instanceof Error ? error.message : String(error)}）`);
 			return { summary: current, note, last };
 		}
 		reviewer.costUsd += result.totalCostUsd;
@@ -278,22 +293,22 @@ async function review(
 		}
 		const findings = result.isError ? null : parseFindings(result.resultText);
 		if (findings === null) {
-			client.event('log', result.isError ? `レビュー役が失敗したので、レビューなしで進めます（${result.subtype}）` : 'レビュー役の返事を読めなかったので、レビューなしで進めます');
+			client.event('log', result.isError ? `${label}の役が失敗したので、${label}なしで進めます（${result.subtype}）` : `${label}の役の返事を読めなかったので、${label}なしで進めます`);
 			return { summary: current, note, last };
 		}
 		let answer;
 		try {
-			answer = await client.review(round, findings, fixedEarlier);
+			answer = await client.review(stage.kind, round, findings, fixedEarlier);
 		} catch (error) {
 			client.event('log', `レビューの結果を送れなかったので、そのまま進めます（${error instanceof Error ? error.message : String(error)}）`);
 			return { summary: current, note, last };
 		}
 		note = answer.pr_note;
 		if (answer.must === 0 || round > retries) {
-			client.event('log', answer.must === 0 ? 'レビューで直すべきものはありませんでした' : 'レビューで直すべきと言われて残ったものを PR の本文に書きます');
+			client.event('log', answer.must === 0 ? `${label}で直すべきものはありませんでした` : `${label}で直すべきと言われて残ったものを PR の本文に書きます`);
 			return { summary: current, note, last };
 		}
-		client.event('log', `レビューで直すべきと言われた ${answer.must} 件を直します`);
+		client.event('log', `${label}で直すべきと言われた ${answer.must} 件を直します`);
 		const fixed = await fix(answer.prompt);
 		if (abort.signal.aborted || fixed.isError) {
 			return { summary: current, note, last };
@@ -301,7 +316,7 @@ async function review(
 		last = fixed;
 		current = fixed.resultText?.trim() || current;
 		fixedEarlier += answer.must;
-		if (await git.commitAll(`${spec.ticket.key}: レビューで直すべきと言われたものを直す`)) {
+		if (await git.commitAll(`${spec.ticket.key}: ${label}で直すべきと言われたものを直す`)) {
 			await git.push();
 		}
 	}

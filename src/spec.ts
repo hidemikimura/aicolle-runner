@@ -39,12 +39,29 @@ export interface RunSpec {
 		presubmit?: boolean;
 		/** 提出前チェックで見つかったものをエージェントに直させる回数 */
 		presubmit_retries?: number;
-		/** レビュー役の AI（PR を作る前に別のセッションで差分をレビューさせる。null・無し = しない。docs/design/ai-review.md） */
+		/**
+		 * レビュー役の AI の段（行う順。敵対的 → 通常。空・無し = しない。docs/design/ai-review.md）。
+		 * 古いサーバーは送らないので、そのときは review を通常のレビューとして使う
+		 */
+		reviews?: ReviewStage[];
+		/** 通常のレビュー（reviews を知らない古いランナー向け。null・無し = しない） */
 		review?: { prompt: string; retries: number } | null;
 	};
 	question_wait_seconds: number;
 	/** 回答の出た判断依頼（決定記録として {docs_root}/decisions/{キー}.md に書く。古いサーバーは送らない） */
 	decisions?: Decision[];
+}
+
+/** レビュー役の AI の段 */
+export interface ReviewStage {
+	/** adversarial = 敵対的レビュー / standard = 通常のレビュー */
+	kind: 'adversarial' | 'standard';
+	/** 表示名（出来事に使う） */
+	label: string;
+	/** レビュー役への指示 */
+	prompt: string;
+	/** 直すべきものを直させる回数 */
+	retries: number;
 }
 
 /** 回答の出た判断依頼 */

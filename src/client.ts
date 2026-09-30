@@ -126,9 +126,9 @@ export class AicolleClient {
 		return (await this.request('POST', `/runner/runs/${this.runId}/presubmit`, { summary })) as PresubmitResult;
 	}
 
-	/** レビュー役の指摘を送る（round は 1 から。fixed_earlier は前のレビューで直させた数） */
-	async review(round: number, findings: ReviewFinding[], fixedEarlier: number): Promise<ReviewResult> {
-		return (await this.request('POST', `/runner/runs/${this.runId}/review`, { round, findings, fixed_earlier: fixedEarlier })) as ReviewResult;
+	/** レビュー役の指摘を送る（kind は段。round は段ごとに 1 から。fixed_earlier はその段の前のレビューで直させた数） */
+	async review(kind: string, round: number, findings: ReviewFinding[], fixedEarlier: number): Promise<ReviewResult> {
+		return (await this.request('POST', `/runner/runs/${this.runId}/review`, { kind, round, findings, fixed_earlier: fixedEarlier })) as ReviewResult;
 	}
 
 	async appendSession(sessionId: string, subpath: string, entries: unknown[]): Promise<void> {

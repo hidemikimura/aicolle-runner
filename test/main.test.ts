@@ -569,6 +569,67 @@ test('レビュー役の AI: 別のセッションでレビューし、直すべ
 	server.close();
 });
 
+test('レビュー役の AI: 2 段（敵対的 → 通常）を別のセッションで順に行い、段ごとに直させる。PR の本文には両方の節', async () => {
+	const reviews: any[] = [];
+	const server = await fakeServer({
+		review: (body) => {
+			reviews.push(body);
+			if (body.kind === 'adversarial') {
+				return body.round === 1
+					? { must: 1, prompt: '直して: 敵対的', pr_note: '### AI の敵対的レビュー（別のセッション・1 回）' }
+					: { must: 0, prompt: '', pr_note: '### AI の敵対的レビュー（別のセッション・2 回）\n\n指摘はありませんでした。' };
+			}
+			return { must: 0, prompt: '', pr_note: '### AI のレビュー（別のセッション・1 回）\n\n指摘はありませんでした。' };
+		},
+	});
+	const bare = origin();
+	const prompts: { prompt: string; resume?: string }[] = [];
+	const seen: { prompt: string; options: any }[] = [];
+	const must = '```json\n{"findings": [{"severity": "must", "title": "別の組織のものが消せる", "detail": "org_id を見ていない"}]}\n```';
+	const none = '```json\n{"findings": []}\n```';
+
+	const body = await execute(
+		spec(server.base, bare, {
+			ai: {
+				...spec('', '').ai,
+				reviews: [
+					{ kind: 'adversarial', label: '敵対的レビュー', prompt: '壊して', retries: 1 },
+					{ kind: 'standard', label: '通常のレビュー', prompt: 'レビューして', retries: 1 },
+				],
+				// 古いランナー向けの review があっても、reviews を使う（通常のレビューを 2 回しない）
+				review: { prompt: 'レビューして', retries: 1 },
+			},
+		}),
+		{ queryFn: withReviewer(prompts, [must, none, none], seen), pollMs: 50 },
+	);
+
+	assert.equal(body.status, 'succeeded');
+	// 敵対的 → （直す）→ 敵対的をもう一度 → 通常。どれも新しいセッション
+	assert.deepEqual(seen.map((s) => s.prompt), ['壊して', '壊して', 'レビューして']);
+	assert.ok(seen.every((s) => s.options.resume === undefined));
+	assert.deepEqual(reviews.map((r) => [r.kind, r.round, r.fixed_earlier]), [['adversarial', 1, 0], ['adversarial', 2, 1], ['standard', 1, 0]]);
+	// 直すのは作業したセッション
+	assert.equal(prompts[1].prompt, '直して: 敵対的');
+	assert.equal(prompts[1].resume, 'sess-1');
+	const pr = server.calls.find((c) => c.method === 'POST' && c.path === '/repos/ecx/sample/pulls');
+	assert.match(pr!.body.body, /### AI の敵対的レビュー（別のセッション・2 回）[\s\S]*### AI のレビュー（別のセッション・1 回）/);
+	const log = execFileSync('git', ['--git-dir', bare, 'log', '--oneline', 'aicolle/PM-1']).toString();
+	assert.match(log, /敵対的レビューで直すべきと言われたものを直す/);
+	server.close();
+});
+
+test('レビュー役の AI: 段が空（reviews: []）ならレビューしない（review があっても）', async () => {
+	const server = await fakeServer({});
+	const seen: { prompt: string; options: any }[] = [];
+	const body = await execute(
+		spec(server.base, origin(), { ai: { ...spec('', '').ai, reviews: [], review: { prompt: 'レビューして', retries: 1 } } }),
+		{ queryFn: withReviewer([], [], seen), pollMs: 50 },
+	);
+	assert.equal(body.status, 'succeeded');
+	assert.equal(seen.length, 0);
+	server.close();
+});
+
 test('レビュー役の返事を読めなければ、レビューなしで PR を作る。設定が無ければレビューしない', async () => {
 	const server = await fakeServer({});
 	const seen: { prompt: string; options: any }[] = [];
